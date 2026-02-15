@@ -145,6 +145,7 @@ from sdp.processors.modify_manifest.make_letters_uppercase_after_period import (
 from sdp.processors.inference.asr.nemo.asr_inference import ASRInference
 from sdp.processors.inference.asr.nemo.lid_inference import AudioLid
 from sdp.processors.inference.asr.faster_whisper.faster_whisper_inference import FasterWhisperInference
+from sdp.processors.inference.asr.batched_whisper.batched_whisper_inference import BatchedWhisperInference
 from sdp.processors.inference.asr.transformers.speech_recognition import ASRTransformers
 from sdp.processors.inference.asr.utils.whisper_hallucinations import DetectWhisperHallucinationFeatures
 from sdp.processors.inference.asr.utils.rttm import GetRttmSegments, SplitAudioFile

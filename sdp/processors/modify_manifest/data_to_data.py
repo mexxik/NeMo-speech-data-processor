@@ -25,7 +25,6 @@ from glob import glob
 import yaml
 
 import soundfile
-import torchaudio
 from docx import Document
 from tqdm import tqdm
 import json
@@ -993,6 +992,7 @@ class ASRFileCheck(BaseProcessor):
             
             try:
                 # Attempt to load the audio file to check if it is corrupted
+                import torchaudio
                 torchaudio.load(full_audio_path)
                 entries.append(entry)  # File is good, append to entries list
             except FileNotFoundError:
