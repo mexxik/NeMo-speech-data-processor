@@ -78,6 +78,219 @@ LANG_TO_TOKEN = {lang: SOT + 1 + i for i, lang in enumerate(_LANG_CODES)}
 TOKEN_TO_LANG = {v: k for k, v in LANG_TO_TOKEN.items()}
 
 
+def _gpu_worker(processor, gpu_id, batch_queue, result_queue, total_entries=0):
+    """Worker with GPU-based mel feature extraction.
+
+    CPU threads load raw audio only (I/O-bound, releases GIL).
+    Mel spectrogram computation runs on GPU via PyTorch STFT — replaces the
+    CPU feature extraction bottleneck (~4-12s) with ~50ms of GPU work.
+    """
+    try:
+        import queue as _queue_mod
+        import time
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        import ctranslate2
+        import torch
+
+        processor._load_model(gpu_id)
+
+        # ── GPU mel feature extraction setup ──────────────────────────
+        device = torch.device(f"cuda:{gpu_id}")
+        n_fft = 400
+        hop_length = 160
+        N_FRAMES = 3000  # 30s at 100 fps
+
+        # Mel filterbank from faster_whisper (shape: 80 × n_freq)
+        mel_filters_np = processor.feature_extractor.mel_filters
+        n_freq = mel_filters_np.shape[1]  # 200 for faster_whisper
+        mel_filters_gpu = torch.from_numpy(mel_filters_np).float().to(device)
+
+        # Periodic Hann window — matches np.hanning(n_fft+1)[:-1]
+        hann_window = torch.hann_window(n_fft, periodic=True, device=device)
+
+        def _extract_features_gpu(audio_arrays):
+            """Batched mel spectrogram on GPU. Replicates faster_whisper's
+            FeatureExtractor exactly: STFT → power spectrum → mel → log norm.
+            """
+            max_len = max(a.shape[0] for a in audio_arrays)
+            B = len(audio_arrays)
+
+            # Pad all audio to same length, build batch tensor
+            batch_np = np.zeros((B, max_len), dtype=np.float32)
+            for i, audio in enumerate(audio_arrays):
+                batch_np[i, : len(audio)] = audio
+            batch_audio = torch.from_numpy(batch_np).to(device)
+
+            # Batched STFT  (center=False matches faster_whisper framing)
+            stft = torch.stft(
+                batch_audio,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                window=hann_window,
+                center=False,
+                return_complex=True,
+            )
+            # stft: (B, n_fft//2+1, T) = (B, 201, T)
+            # Keep first n_freq bins to match faster_whisper's stft[:, :-1]
+            magnitudes = stft[:, :n_freq, :].abs().pow(2)
+
+            # Mel filterbank: (80, n_freq) @ (B, n_freq, T) → (B, 80, T)
+            mel_spec = torch.matmul(mel_filters_gpu, magnitudes)
+
+            # Log scale + dynamic range compression (per-sample)
+            log_spec = torch.log10(torch.clamp(mel_spec, min=1e-10))
+            log_max = log_spec.flatten(1).max(dim=1).values[:, None, None]
+            log_spec = torch.maximum(log_spec, log_max - 8.0)
+            log_spec = (log_spec + 4.0) / 4.0
+
+            # Pad / truncate to N_FRAMES
+            T = log_spec.shape[2]
+            if T < N_FRAMES:
+                log_spec = torch.nn.functional.pad(log_spec, (0, N_FRAMES - T))
+            elif T > N_FRAMES:
+                log_spec = log_spec[:, :, :N_FRAMES]
+
+            return log_spec.cpu().numpy()  # (B, 80, 3000)
+
+        # ── Audio loading (CPU threads, I/O-bound) ───────────────────
+        import soundfile as sf
+
+        def _load_audio_only(entry):
+            """Load one audio file. Uses soundfile for 43x faster WAV reads
+            vs PyAV. Falls back to processor._load_audio for slice_by_offset."""
+            try:
+                if processor.slice_by_offset:
+                    audio = processor._load_audio(entry)
+                    return entry, audio
+                filepath = entry[processor.audio_filepath_field]
+                audio, sr = sf.read(filepath, dtype="float32")
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                return entry, audio
+            except Exception:
+                if processor.skip_corrupted:
+                    return entry, None
+                raise
+
+        worker_pool = ThreadPoolExecutor(max_workers=12)
+
+        def _prefetch_audio(batch_entries):
+            """Load audio for a whole batch in parallel CPU threads."""
+            t0 = time.monotonic()
+            futs = [worker_pool.submit(_load_audio_only, e) for e in batch_entries]
+            results = [f.result() for f in futs]
+
+            valid_entries = []
+            audio_list = []
+            skipped = 0
+            for entry, audio in results:
+                if audio is not None:
+                    valid_entries.append(entry)
+                    audio_list.append(audio)
+                else:
+                    skipped += 1
+
+            return valid_entries, audio_list, skipped, time.monotonic() - t0
+
+        # ── Prefetch pipeline ─────────────────────────────────────────
+        PREFETCH_DEPTH = 3
+        prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        prefetch_deque = deque()
+
+        done_feeding = False
+        for _ in range(PREFETCH_DEPTH):
+            item = batch_queue.get()
+            if item is None:
+                done_feeding = True
+                break
+            prefetch_deque.append(prefetch_pool.submit(_prefetch_audio, item))
+
+        all_results = []
+        total_skipped = 0
+        batch_count = 0
+        t_start = time.monotonic()
+        cum_wait = 0.0
+        cum_feat = 0.0
+        cum_infer = 0.0
+
+        while prefetch_deque:
+            # Wait for next batch of raw audio
+            t0 = time.monotonic()
+            valid_entries, audio_list, skipped, t_audio = prefetch_deque.popleft().result()
+            t_wait = time.monotonic() - t0
+            cum_wait += t_wait
+
+            total_skipped += skipped
+            batch_count += 1
+
+            t_feat = 0.0
+            t_infer = 0.0
+            if valid_entries:
+                # GPU feature extraction (replaces CPU bottleneck)
+                t0 = time.monotonic()
+                features_np = _extract_features_gpu(audio_list)
+                features = ctranslate2.StorageView.from_array(features_np)
+                t_feat = time.monotonic() - t0
+                cum_feat += t_feat
+
+                # GPU inference
+                t0 = time.monotonic()
+                results = processor._run_inference(valid_entries, features)
+                t_infer = time.monotonic() - t0
+                cum_infer += t_infer
+                all_results.extend(results)
+
+            # Replenish prefetch
+            if not done_feeding:
+                while len(prefetch_deque) < PREFETCH_DEPTH:
+                    try:
+                        item = batch_queue.get_nowait()
+                    except _queue_mod.Empty:
+                        break
+                    if item is None:
+                        done_feeding = True
+                        break
+                    prefetch_deque.append(prefetch_pool.submit(_prefetch_audio, item))
+
+                if not prefetch_deque and not done_feeding:
+                    item = batch_queue.get()
+                    if item is None:
+                        done_feeding = True
+                    else:
+                        prefetch_deque.append(prefetch_pool.submit(_prefetch_audio, item))
+
+            # Progress
+            elapsed = time.monotonic() - t_start
+            done_count = len(all_results) + total_skipped
+            rate = done_count / elapsed if elapsed > 0 else 0
+            eta = (total_entries - done_count) / rate if rate > 0 else 0
+            eta_m, eta_s = divmod(int(eta), 60)
+            eta_h, eta_m = divmod(eta_m, 60)
+            progress = f"{done_count}/{total_entries}" if total_entries else str(done_count)
+            logger.info(
+                f"GPU:{gpu_id} | batch {batch_count} | {progress} "
+                f"| {rate:.0f} items/s | ETA {eta_h}h{eta_m:02d}m{eta_s:02d}s "
+                f"| wait={t_wait:.3f}s audio={t_audio:.3f}s "
+                f"feat={t_feat:.3f}s infer={t_infer:.3f}s "
+                f"| cum: wait={cum_wait:.1f}s feat={cum_feat:.1f}s infer={cum_infer:.1f}s"
+            )
+
+        elapsed = time.monotonic() - t_start
+        logger.info(
+            f"GPU:{gpu_id} finished: {len(all_results)} processed, "
+            f"{total_skipped} skipped in {elapsed:.1f}s"
+        )
+        result_queue.put((gpu_id, all_results, total_skipped, None))
+        prefetch_pool.shutdown(wait=False)
+        worker_pool.shutdown(wait=False)
+    except Exception as e:
+        import traceback as _tb
+        logger.error(f"GPU:{gpu_id} worker error: {e}\n{_tb.format_exc()}")
+        result_queue.put((gpu_id, [], 0, e))
+
+
 def _parse_timestamp_tokens(token_ids, tokenizer):
     """Parse Whisper output tokens into text and timestamp segments.
 
@@ -468,12 +681,21 @@ class BatchedWhisperInference(BaseProcessor):
         else:
             return self._process_transcription_batch(valid_entries, features)
 
-    def _process_single_gpu(self, batches, device_index=0):
-        """Process batches on a single GPU with prefetch pipeline.
+    def _process_single_gpu(self, batches, device_index=0, total_entries=0):
+        """Process batches on a single GPU with GPU-based feature extraction.
+
+        Uses the same optimizations as _gpu_worker: soundfile for audio loading
+        and PyTorch STFT on GPU for mel features.
 
         Returns (results_list, total_skipped).
         """
+        import time
+        from collections import deque
         from concurrent.futures import ThreadPoolExecutor
+
+        import ctranslate2
+        import soundfile as sf
+        import torch
 
         self._load_model(device_index)
 
@@ -483,28 +705,118 @@ class BatchedWhisperInference(BaseProcessor):
         if num_batches == 0:
             return all_results, 0
 
-        prefetch_pool = ThreadPoolExecutor(max_workers=1)
-        prefetch_future = prefetch_pool.submit(self._prefetch_batch, batches[0])
+        # ── GPU mel feature extraction setup ──────────────────────────
+        device = torch.device(f"cuda:{device_index}")
+        n_fft = 400
+        hop_length = 160
+        N_FRAMES = 3000
 
-        for batch_idx in tqdm(
-            range(num_batches),
-            desc=f"GPU:{device_index}",
-            total=num_batches,
-            position=device_index,
-        ):
-            valid_entries, features, skipped = prefetch_future.result()
+        mel_filters_np = self.feature_extractor.mel_filters
+        n_freq = mel_filters_np.shape[1]
+        mel_filters_gpu = torch.from_numpy(mel_filters_np).float().to(device)
+        hann_window = torch.hann_window(n_fft, periodic=True, device=device)
+
+        def _extract_features_gpu(audio_arrays):
+            max_len = max(a.shape[0] for a in audio_arrays)
+            B = len(audio_arrays)
+            batch_np = np.zeros((B, max_len), dtype=np.float32)
+            for i, audio in enumerate(audio_arrays):
+                batch_np[i, : len(audio)] = audio
+            batch_audio = torch.from_numpy(batch_np).to(device)
+            stft = torch.stft(
+                batch_audio, n_fft=n_fft, hop_length=hop_length,
+                window=hann_window, center=False, return_complex=True,
+            )
+            magnitudes = stft[:, :n_freq, :].abs().pow(2)
+            mel_spec = torch.matmul(mel_filters_gpu, magnitudes)
+            log_spec = torch.log10(torch.clamp(mel_spec, min=1e-10))
+            log_max = log_spec.flatten(1).max(dim=1).values[:, None, None]
+            log_spec = torch.maximum(log_spec, log_max - 8.0)
+            log_spec = (log_spec + 4.0) / 4.0
+            T = log_spec.shape[2]
+            if T < N_FRAMES:
+                log_spec = torch.nn.functional.pad(log_spec, (0, N_FRAMES - T))
+            elif T > N_FRAMES:
+                log_spec = log_spec[:, :, :N_FRAMES]
+            return log_spec.cpu().numpy()
+
+        # ── Audio loading ─────────────────────────────────────────────
+        processor_self = self
+
+        def _load_audio_only(entry):
+            try:
+                if processor_self.slice_by_offset:
+                    audio = processor_self._load_audio(entry)
+                    return entry, audio
+                filepath = entry[processor_self.audio_filepath_field]
+                audio, sr = sf.read(filepath, dtype="float32")
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                return entry, audio
+            except Exception:
+                if processor_self.skip_corrupted:
+                    return entry, None
+                raise
+
+        worker_pool = ThreadPoolExecutor(max_workers=12)
+
+        def _prefetch_audio(batch_entries):
+            t0 = time.monotonic()
+            futs = [worker_pool.submit(_load_audio_only, e) for e in batch_entries]
+            results = [f.result() for f in futs]
+            valid_entries = []
+            audio_list = []
+            skipped = 0
+            for entry, audio in results:
+                if audio is not None:
+                    valid_entries.append(entry)
+                    audio_list.append(audio)
+                else:
+                    skipped += 1
+            return valid_entries, audio_list, skipped, time.monotonic() - t0
+
+        # ── Prefetch pipeline ─────────────────────────────────────────
+        PREFETCH_DEPTH = 3
+        prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        prefetch_queue = deque()
+        for i in range(min(PREFETCH_DEPTH, num_batches)):
+            prefetch_queue.append(prefetch_pool.submit(_prefetch_audio, batches[i]))
+        next_submit = PREFETCH_DEPTH
+
+        t_start = time.monotonic()
+        cum_wait = 0.0
+        cum_feat = 0.0
+        cum_infer = 0.0
+
+        for batch_idx in range(num_batches):
+            t0 = time.monotonic()
+            valid_entries, audio_list, skipped, t_audio = prefetch_queue.popleft().result()
+            t_wait = time.monotonic() - t0
+            cum_wait += t_wait
             total_skipped += skipped
 
-            if batch_idx + 1 < num_batches:
-                prefetch_future = prefetch_pool.submit(
-                    self._prefetch_batch, batches[batch_idx + 1]
+            if next_submit < num_batches:
+                prefetch_queue.append(
+                    prefetch_pool.submit(_prefetch_audio, batches[next_submit])
                 )
+                next_submit += 1
 
             if not valid_entries:
                 continue
 
+            t_feat = 0.0
+            t_infer = 0.0
             try:
+                t0 = time.monotonic()
+                features_np = _extract_features_gpu(audio_list)
+                features = ctranslate2.StorageView.from_array(features_np)
+                t_feat = time.monotonic() - t0
+                cum_feat += t_feat
+
+                t0 = time.monotonic()
                 results = self._run_inference(valid_entries, features)
+                t_infer = time.monotonic() - t0
+                cum_infer += t_infer
                 all_results.extend(results)
             except Exception:
                 if self.skip_corrupted:
@@ -517,95 +829,117 @@ class BatchedWhisperInference(BaseProcessor):
                     continue
                 raise
 
+            # Progress
+            elapsed = time.monotonic() - t_start
+            done_count = len(all_results) + total_skipped
+            rate = done_count / elapsed if elapsed > 0 else 0
+            eta = (total_entries - done_count) / rate if rate > 0 else 0
+            eta_m, eta_s = divmod(int(eta), 60)
+            eta_h, eta_m = divmod(eta_m, 60)
+            progress = f"{done_count}/{total_entries}" if total_entries else str(done_count)
+            logger.info(
+                f"GPU:{device_index} | batch {batch_idx+1}/{num_batches} | {progress} "
+                f"| {rate:.0f} items/s | ETA {eta_h}h{eta_m:02d}m{eta_s:02d}s "
+                f"| wait={t_wait:.3f}s audio={t_audio:.3f}s "
+                f"feat={t_feat:.3f}s infer={t_infer:.3f}s "
+                f"| cum: wait={cum_wait:.1f}s feat={cum_feat:.1f}s infer={cum_infer:.1f}s"
+            )
+
         prefetch_pool.shutdown(wait=False)
+        worker_pool.shutdown(wait=False)
         return all_results, total_skipped
 
     def process(self):
         """Main entry point: load model(s), batch-process manifest, write output.
 
         When num_devices > 1, spawns one process per GPU. Each process loads
-        its own model and processes interleaved batches. Results are merged
-        in original manifest order.
+        its own model once and pulls batches from a shared queue across all
+        manifest chunks, avoiding costly model reloads between chunks.
         """
         self._prepare()
+
+        # Count total entries for progress reporting
+        total_entries = 0
+        with open(self.input_manifest_file, "r", encoding="utf8") as f:
+            for _ in f:
+                total_entries += 1
+        logger.info(f"Total manifest entries: {total_entries}")
 
         total_processed = 0
         total_skipped = 0
 
-        with open(self.output_manifest_file, "w", encoding="utf8") as fout:
-            for chunk in self._chunk_manifest():
-                # Sort by duration for efficient batching (less padding waste)
-                chunk.sort(key=lambda e: e.get("duration", 0))
-
-                batches = [
-                    chunk[i : i + self.batch_size]
-                    for i in range(0, len(chunk), self.batch_size)
-                ]
-                if not batches:
-                    continue
-
-                if self.num_devices <= 1:
-                    # Single GPU: run directly
-                    results, skipped = self._process_single_gpu(batches, device_index=0)
+        if self.num_devices <= 1:
+            with open(self.output_manifest_file, "w", encoding="utf8") as fout:
+                for chunk in self._chunk_manifest():
+                    chunk.sort(key=lambda e: e.get("duration", 0))
+                    batches = [
+                        chunk[i : i + self.batch_size]
+                        for i in range(0, len(chunk), self.batch_size)
+                    ]
+                    if not batches:
+                        continue
+                    results, skipped = self._process_single_gpu(batches, device_index=0, total_entries=total_entries)
                     total_skipped += skipped
                     for entry in results:
                         fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
                     total_processed += len(results)
-                else:
-                    # Multi-GPU: distribute batches round-robin across GPUs
-                    import multiprocessing as mp
+        else:
+            import multiprocessing as mp
 
-                    gpu_batches = [[] for _ in range(self.num_devices)]
-                    for i, batch in enumerate(batches):
-                        gpu_batches[i % self.num_devices].append(batch)
+            ctx = mp.get_context("spawn")
+            # Shared queue — all GPUs pull batches from same queue.
+            # Faster GPUs naturally grab more work (auto load-balancing).
+            # Only manifest entries (file paths) go through the queue — no audio data.
+            batch_queue = ctx.Queue()
+            result_queue = ctx.Queue()
+
+            entries_per_gpu = total_entries // self.num_devices
+            processes = []
+            for gpu_id in range(self.num_devices):
+                p = ctx.Process(
+                    target=_gpu_worker,
+                    args=(self, gpu_id, batch_queue, result_queue, entries_per_gpu),
+                )
+                p.start()
+                processes.append(p)
+
+            with open(self.output_manifest_file, "w", encoding="utf8") as fout:
+                for chunk in self._chunk_manifest():
+                    chunk.sort(key=lambda e: e.get("duration", 0))
+                    batches = [
+                        chunk[i : i + self.batch_size]
+                        for i in range(0, len(chunk), self.batch_size)
+                    ]
+                    if not batches:
+                        continue
 
                     logger.info(
-                        f"Distributing {len(batches)} batches across "
-                        f"{self.num_devices} GPUs: "
-                        + ", ".join(f"GPU:{i}={len(b)}" for i, b in enumerate(gpu_batches))
+                        f"Queuing {len(batches)} batches for {self.num_devices} GPUs"
                     )
 
-                    # Use spawn context to avoid CUDA fork issues
-                    ctx = mp.get_context("spawn")
-                    result_queue = ctx.Queue()
+                    for batch in batches:
+                        batch_queue.put(batch)
 
-                    def _gpu_worker(gpu_id, worker_batches, queue):
-                        """Worker function that runs in a separate process."""
-                        try:
-                            results, skipped = self._process_single_gpu(
-                                worker_batches, device_index=gpu_id
-                            )
-                            queue.put((gpu_id, results, skipped, None))
-                        except Exception as e:
-                            queue.put((gpu_id, [], 0, e))
+                # Send sentinels (one per worker)
+                for _ in range(self.num_devices):
+                    batch_queue.put(None)
 
-                    processes = []
-                    for gpu_id in range(self.num_devices):
-                        if not gpu_batches[gpu_id]:
-                            continue
-                        p = ctx.Process(
-                            target=_gpu_worker,
-                            args=(gpu_id, gpu_batches[gpu_id], result_queue),
-                        )
-                        p.start()
-                        processes.append(p)
+                # Collect results
+                for p in processes:
+                    p.join()
 
-                    # Collect results from all GPUs
-                    for _ in processes:
-                        gpu_id, results, skipped, error = result_queue.get()
-                        if error:
-                            logger.error(f"GPU:{gpu_id} failed: {error}")
-                            raise error
-                        total_skipped += skipped
-                        for entry in results:
-                            fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                        total_processed += len(results)
-                        logger.info(
-                            f"GPU:{gpu_id} done: {len(results)} processed, {skipped} skipped"
-                        )
-
-                    for p in processes:
-                        p.join()
+                while not result_queue.empty():
+                    gpu_id, results, skipped, error = result_queue.get()
+                    if error:
+                        logger.error(f"GPU:{gpu_id} failed: {error}")
+                        raise error
+                    total_skipped += skipped
+                    for entry in results:
+                        fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    total_processed += len(results)
+                    logger.info(
+                        f"GPU:{gpu_id} done: {len(results)} processed, {skipped} skipped"
+                    )
 
         logger.info(
             f"Batched Whisper inference complete: "
