@@ -53,29 +53,12 @@ from sdp.logging import logger
 from sdp.processors.base_processor import BaseProcessor
 
 
-# Whisper special token IDs (multilingual, 99 languages)
+# Fallback Whisper special token IDs — used only for output parsing (SOT/EOT
+# are stable across model versions).  Language/task tokens are resolved from
+# the loaded tokenizer at runtime to support both v2 (99 langs) and v3
+# (100 langs, shifted IDs).
 SOT = 50258           # <|startoftranscript|>
 EOT = 50257           # <|endoftext|>
-TRANSLATE = 50358     # <|translate|>
-TRANSCRIBE = 50359    # <|transcribe|>
-NO_TIMESTAMPS = 50363 # <|notimestamps|>
-TIMESTAMP_BEGIN = 50364  # <|0.00|>
-NO_SPEECH = 50362     # <|nospeech|>
-
-# Language code to token ID mapping (offset from SOT+1)
-_LANG_CODES = [
-    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca",
-    "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms",
-    "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr", "bg", "lt", "la",
-    "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn",
-    "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
-    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be",
-    "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn",
-    "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha",
-    "ba", "jw", "su", "yue",
-]
-LANG_TO_TOKEN = {lang: SOT + 1 + i for i, lang in enumerate(_LANG_CODES)}
-TOKEN_TO_LANG = {v: k for k, v in LANG_TO_TOKEN.items()}
 
 
 def _gpu_worker(processor, gpu_id, batch_queue, result_queue, total_entries=0):
@@ -291,12 +274,15 @@ def _gpu_worker(processor, gpu_id, batch_queue, result_queue, total_entries=0):
         result_queue.put((gpu_id, [], 0, e))
 
 
-def _parse_timestamp_tokens(token_ids, tokenizer):
+def _parse_timestamp_tokens(token_ids, tokenizer, timestamp_begin, eot=EOT, sot=SOT):
     """Parse Whisper output tokens into text and timestamp segments.
 
     Args:
         token_ids: Output token IDs from CTranslate2 generate().
         tokenizer: HuggingFace WhisperTokenizer for decoding text.
+        timestamp_begin: Token ID for the first timestamp (<|0.00|>).
+        eot: End-of-text token ID.
+        sot: Start-of-transcript token ID (text tokens are below this).
 
     Returns:
         Dict with "text" (full text) and "segments" (list of segment dicts).
@@ -307,11 +293,11 @@ def _parse_timestamp_tokens(token_ids, tokenizer):
     segment_id = 0
 
     for token_id in token_ids:
-        if token_id == EOT:
+        if token_id == eot:
             break
 
-        if token_id >= TIMESTAMP_BEGIN:
-            timestamp = (token_id - TIMESTAMP_BEGIN) * 0.02
+        if token_id >= timestamp_begin:
+            timestamp = (token_id - timestamp_begin) * 0.02
             if current_start is None:
                 current_start = timestamp
             else:
@@ -326,18 +312,20 @@ def _parse_timestamp_tokens(token_ids, tokenizer):
                     segment_id += 1
                 current_text_tokens = []
                 current_start = timestamp
-        elif token_id < SOT:
+        elif token_id < sot:
             # Regular text token (below special token range)
             current_text_tokens.append(token_id)
 
-    # Handle trailing text
+    # Handle trailing text (no closing timestamp — set end=start so
+    # downstream duration filters drop these incomplete segments).
     if current_text_tokens:
         text = tokenizer.decode(current_text_tokens, skip_special_tokens=False).strip()
         if text:
+            start_val = round(current_start or 0.0, 2)
             segments.append({
                 "id": segment_id,
-                "start": round(current_start or 0.0, 2),
-                "end": None,
+                "start": start_val,
+                "end": start_val,
                 "text": text,
             })
 
@@ -450,8 +438,31 @@ class BatchedWhisperInference(BaseProcessor):
         self.tokenizer = self.fw_model.hf_tokenizer
         self._decode_audio = decode_audio
 
+        # Resolve special token IDs from the loaded tokenizer — handles both
+        # Whisper v2 (99 languages) and v3 (100 languages, shifted IDs).
+        tok = self.tokenizer
+        self._tok_sot = tok.token_to_id("<|startoftranscript|>")
+        self._tok_eot = tok.token_to_id("<|endoftext|>")
+        self._tok_transcribe = tok.token_to_id("<|transcribe|>")
+        self._tok_translate = tok.token_to_id("<|translate|>")
+        self._tok_no_timestamps = tok.token_to_id("<|notimestamps|>")
+        self._tok_timestamp_begin = self._tok_no_timestamps + 1
+
+        # Resolve language token if set
+        if self.language:
+            self._tok_language = tok.token_to_id(f"<|{self.language}|>")
+            if self._tok_language is None:
+                raise ValueError(
+                    f"Tokenizer has no token for language '{self.language}'"
+                )
+        else:
+            self._tok_language = None
+
         logger.info(
-            f"Model loaded on {self.ct2_model.device}. Batch size: {self.batch_size}"
+            f"Model loaded on {self.ct2_model.device}. Batch size: {self.batch_size}. "
+            f"Tokens: SOT={self._tok_sot} lang={self._tok_language} "
+            f"transcribe={self._tok_transcribe} translate={self._tok_translate} "
+            f"no_ts={self._tok_no_timestamps} ts_begin={self._tok_timestamp_begin}"
         )
 
     def _read_manifest(self):
@@ -518,6 +529,9 @@ class BatchedWhisperInference(BaseProcessor):
     def _build_prompts(self, batch_size: int, with_timestamps: bool) -> List[List[int]]:
         """Build decoder prompt token IDs for the batch.
 
+        Uses token IDs resolved from the loaded tokenizer (set in _load_model)
+        so this works correctly across Whisper model versions.
+
         Args:
             batch_size: Number of items in the batch.
             with_timestamps: If True, enable timestamp token generation.
@@ -525,18 +539,16 @@ class BatchedWhisperInference(BaseProcessor):
         Returns:
             List of prompt token ID lists, one per batch item.
         """
-        task_token = TRANSCRIBE if self.task == "transcribe" else TRANSLATE
+        task_token = (self._tok_transcribe if self.task == "transcribe"
+                      else self._tok_translate)
 
-        if self.language:
-            lang_token = LANG_TO_TOKEN.get(self.language)
-            if lang_token is None:
-                raise ValueError(f"Unknown language code: {self.language}")
-            prompt = [SOT, lang_token, task_token]
+        if self._tok_language is not None:
+            prompt = [self._tok_sot, self._tok_language, task_token]
         else:
-            prompt = [SOT, task_token]
+            prompt = [self._tok_sot, task_token]
 
         if not with_timestamps:
-            prompt.append(NO_TIMESTAMPS)
+            prompt.append(self._tok_no_timestamps)
 
         return [prompt] * batch_size
 
@@ -548,7 +560,8 @@ class BatchedWhisperInference(BaseProcessor):
         for entry, lang_probs in zip(entries, lang_results):
             if lang_probs:
                 top_lang, top_prob = lang_probs[0]
-                entry["language"] = top_lang
+                # Strip <| |> wrapper from CTranslate2 language tokens
+                entry["language"] = top_lang.strip("<|>")
                 entry["language_probability"] = round(top_prob, 4)
             else:
                 entry["language"] = "unknown"
@@ -577,7 +590,10 @@ class BatchedWhisperInference(BaseProcessor):
         results = []
         for entry, gen_result in zip(entries, gen_results):
             token_ids = gen_result.sequences_ids[0]  # Best hypothesis
-            parsed = _parse_timestamp_tokens(token_ids, self.tokenizer)
+            parsed = _parse_timestamp_tokens(
+                token_ids, self.tokenizer, self._tok_timestamp_begin,
+                eot=self._tok_eot, sot=self._tok_sot,
+            )
 
             entry["pred_text"] = parsed["text"]
             entry["language"] = self.language or "unknown"
@@ -614,7 +630,7 @@ class BatchedWhisperInference(BaseProcessor):
         for entry, gen_result in zip(entries, gen_results):
             token_ids = gen_result.sequences_ids[0]
             # Filter out any special tokens, keep only text
-            text_tokens = [t for t in token_ids if t < SOT and t != EOT]
+            text_tokens = [t for t in token_ids if t < self._tok_sot and t != self._tok_eot]
             pred_text = self.tokenizer.decode(text_tokens, skip_special_tokens=False).strip()
 
             entry["pred_text"] = pred_text
@@ -924,11 +940,10 @@ class BatchedWhisperInference(BaseProcessor):
                 for _ in range(self.num_devices):
                     batch_queue.put(None)
 
-                # Collect results
-                for p in processes:
-                    p.join()
-
-                while not result_queue.empty():
+                # Collect results — drain queue BEFORE join to avoid deadlock.
+                # Workers put large results (~142K entries) which can fill the
+                # pipe buffer; if we join() first, workers block on put() forever.
+                for _ in range(self.num_devices):
                     gpu_id, results, skipped, error = result_queue.get()
                     if error:
                         logger.error(f"GPU:{gpu_id} failed: {error}")
@@ -940,6 +955,9 @@ class BatchedWhisperInference(BaseProcessor):
                     logger.info(
                         f"GPU:{gpu_id} done: {len(results)} processed, {skipped} skipped"
                     )
+
+                for p in processes:
+                    p.join()
 
         logger.info(
             f"Batched Whisper inference complete: "
