@@ -1140,6 +1140,10 @@ class ListToEntries(BaseParallelProcessor):
         # Remove the list field from the entry and get the list of items
         items_list = data_entry.pop(self.field_with_list)
 
+        # Empty list — nothing to expand, drop this entry
+        if len(items_list) == 0:
+            return []
+
         # If items are not dicts, output_field must be specified to store the item
         if not isinstance(items_list[0], dict) and not self.output_field:
             raise ValueError(f'Type of items in items list `{self.field_with_list}` is not dict ({type(items_list[0])}). In this case `output_field` should be provided.')
